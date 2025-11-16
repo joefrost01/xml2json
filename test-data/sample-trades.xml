@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<trades>
+  <message>
+    <trade>
+      <id>TRD-2024-001</id>
+      <timestamp>2024-01-15T10:30:00Z</timestamp>
+      <symbol>AAPL</symbol>
+      <quantity>100</quantity>
+      <price>150.25</price>
+      <side>BUY</side>
+      <trader>
+        <id>T-12345</id>
+        <name>John Smith</name>
+        <desk>Equities</desk>
+      </trader>
+      <venue>NASDAQ</venue>
+    </trade>
+  </message>
+  <message>
+    <trade>
+      <id>TRD-2024-002</id>
+      <timestamp>2024-01-15T10:31:15Z</timestamp>
+      <symbol>GOOGL</symbol>
+      <quantity>50</quantity>
+      <price>2800.50</price>
+      <side>SELL</side>
+      <trader>
+        <id>T-67890</id>
+        <name>Jane Doe</name>
+        <desk>Equities</desk>
+      </trader>
+      <venue>NASDAQ</venue>
+    </trade>
+  </message>
+  <message>
+    <trade>
+      <id>TRD-2024-003</id>
+      <timestamp>2024-01-15T10:32:30Z</timestamp>
+      <symbol>MSFT</symbol>
+      <quantity>200</quantity>
+      <price>380.75</price>
+      <side>BUY</side>
+      <trader>
+        <id>T-12345</id>
+        <name>John Smith</name>
+        <desk>Equities</desk>
+      </trader>
+      <venue>NASDAQ</venue>
+    </trade>
+  </message>
+</trades>

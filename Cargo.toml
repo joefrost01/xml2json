@@ -1,0 +1,44 @@
+[package]
+name = "xml2json"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# XML parsing
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Parallelism
+rayon = "1.10"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# GCS support
+google-cloud-storage = "0.22"
+google-cloud-auth = "0.17"
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "macros"] }
+
+# Progress indication
+indicatif = { version = "0.17", features = ["rayon"] }
+
+# Utilities
+walkdir = "2.5"
+rand = "0.8.5"
+
+[dev-dependencies]
+tempfile = "3.13"
+
+[profile.release]
+opt-level = 3           # Maximum optimization
+lto = "fat"             # Full link-time optimization across all crates
+codegen-units = 1       # Better optimization, slower compile (worth it for release)
+strip = true            # Strip symbols for smaller binary
+panic = "abort"         # Smaller binary, slight perf gain (no unwinding)

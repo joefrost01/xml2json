@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<trades>
+  <message>
+    <trade>
+      <id>TRD-2024-004</id>
+      <timestamp>2024-01-15T11:00:00Z</timestamp>
+      <symbol>TSLA</symbol>
+      <quantity>75</quantity>
+      <price>245.30</price>
+      <side>BUY</side>
+      <trader>
+        <id>T-11111</id>
+        <n>Alice Johnson</n>
+        <desk>Tech</desk>
+      </trader>
+      <venue>NASDAQ</venue>
+    </trade>
+  </message>
+  <message>
+    <trade>
+      <id>TRD-2024-005</id>
+      <timestamp>2024-01-15T11:05:22Z</timestamp>
+      <symbol>NVDA</symbol>
+      <quantity>150</quantity>
+      <price>495.80</price>
+      <side>SELL</side>
+      <trader>
+        <id>T-22222</id>
+        <n>Bob Williams</n>
+        <desk>Tech</desk>
+      </trader>
+      <venue>NASDAQ</venue>
+    </trade>
+  </message>
+</trades>
