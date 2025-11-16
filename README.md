@@ -253,7 +253,7 @@ export RAYON_NUM_THREADS=4
 
 ## License
 
-MIT
+[MIT License](LICENSE)
 
 ## Contributing
 
@@ -262,3 +262,4 @@ Contributions welcome! Please ensure:
 - Tests pass: `cargo test`
 - Formatting is correct: `cargo fmt`
 - No clippy warnings: `cargo clippy`
+

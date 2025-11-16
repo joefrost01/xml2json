@@ -7,7 +7,7 @@ use crate::error::{ConversionError, Result};
 use crate::storage::Storage;
 use indicatif::{ProgressBar, ProgressStyle};
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::{Reader, Writer as XmlWriter};
 use rayon::prelude::*;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -40,12 +40,18 @@ impl Default for ConverterConfig {
 /// Main converter that orchestrates the conversion process
 pub struct Converter {
     config: ConverterConfig,
+    /// Cached bytes for the message element name to avoid per-event String allocations
+    message_element_bytes: Vec<u8>,
 }
 
 impl Converter {
     /// Create a new converter with the given configuration
     pub fn new(config: ConverterConfig) -> Self {
-        Self { config }
+        let message_element_bytes = config.message_element.as_bytes().to_vec();
+        Self {
+            config,
+            message_element_bytes,
+        }
     }
 
     /// Convert all XML files from source to NDJSON in destination
@@ -232,7 +238,7 @@ impl Converter {
     }
 
     /// Convert XML stream to NDJSON, writing each message as a line
-    fn convert_xml_to_ndjson<R: BufRead, W: Write>(
+    pub fn convert_xml_to_ndjson<R: BufRead, W: Write>(
         &self,
         reader: R,
         writer: &mut W,
@@ -241,148 +247,222 @@ impl Converter {
         xml_reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        let mut xml_writer = quick_xml::Writer::new(Vec::new());
-        let mut inside_message = false;
-        let mut depth = 0;
+        let mut xml_writer = XmlWriter::new(Vec::new());
 
+        let mut inside_message = false;
+        let mut depth: u32 = 0;
         let mut stats = FileStats::default();
 
         loop {
-            let event = xml_reader.read_event_into(&mut buf)?;
-            
-            match event {
-                Event::Start(ref e) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+            buf.clear();
+            let event = xml_reader
+                .read_event_into(&mut buf)
+                .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
 
-                    if name == self.config.message_element && depth == 0 {
+            match &event {
+                Event::Eof => {
+                    break;
+                }
+
+                Event::Start(e) => {
+                    // FIX: keep Name alive via a binding
+                    let name_tmp = e.name();
+                    let name = name_tmp.as_ref();
+
+                    // Detect start of a top-level message element
+                    if name == &*self.message_element_bytes && depth == 0 {
                         inside_message = true;
-                        xml_writer = quick_xml::Writer::new(Vec::new());
+                        xml_writer = XmlWriter::new(Vec::new());
                     }
 
                     if inside_message {
-                        xml_writer.write_event(Event::Start(e.clone()))?;
+                        xml_writer
+                            .write_event(event.clone())
+                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
                         depth += 1;
                     }
                 }
-                Event::End(ref e) => {
-                    if inside_message {
-                        let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                        xml_writer.write_event(Event::End(e.clone()))?;
-                        depth -= 1;
 
-                        if name == self.config.message_element && depth == 0 {
-                            // Get the XML string from the writer
+                Event::End(e) => {
+                    if inside_message {
+                        // FIX: same lifetime trick here
+                        let name_tmp = e.name();
+                        let name = name_tmp.as_ref();
+
+                        xml_writer
+                            .write_event(event.clone())
+                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+
+                        if depth > 0 {
+                            depth -= 1;
+                        }
+
+                        // End of the message element at depth 0
+                        if name == &*self.message_element_bytes && depth == 0 {
                             let xml_bytes = xml_writer.into_inner();
-                            let xml_str = String::from_utf8_lossy(&xml_bytes).to_string();
-                            
-                            // Convert to JSON and write
-                            let json_line = self.xml_to_json(&xml_str)?;
-                            writeln!(writer, "{}", json_line).map_err(|e| {
-                                ConversionError::WriteError(format!("Failed to write JSON: {}", e))
+                            let xml_str = String::from_utf8(xml_bytes).map_err(|e| {
+                                ConversionError::XmlParseError(format!(
+                                    "Invalid UTF-8 in XML message: {e}"
+                                ))
                             })?;
 
+                            let json_value = self.xml_to_json_value(&xml_str)?;
+
+                            // FIX: reborrow writer so it isn’t “moved”
+                            serde_json::to_writer(&mut *writer, &json_value).map_err(|e| {
+                                ConversionError::JsonSerializeError(e.to_string())
+                            })?;
+                            writer
+                                .write_all(b"\n")
+                                .map_err(|e| ConversionError::WriteError(e.to_string()))?;
+
                             stats.messages_converted += 1;
-                            stats.bytes_processed += xml_bytes.len() as u64;
+                            stats.bytes_processed += xml_str.len() as u64;
 
                             inside_message = false;
-                            xml_writer = quick_xml::Writer::new(Vec::new());
+                            xml_writer = XmlWriter::new(Vec::new());
                         }
                     }
                 }
-                Event::Text(ref e) => {
+
+                Event::Empty(e) => {
+                    // Handle <message ... /> cases just in case
+                    let name_tmp = e.name();
+                    let name = name_tmp.as_ref();
+
+                    if name == &*self.message_element_bytes && depth == 0 {
+                        inside_message = true;
+                        xml_writer = XmlWriter::new(Vec::new());
+                    }
+
                     if inside_message {
-                        xml_writer.write_event(Event::Text(e.clone()))?;
+                        xml_writer
+                            .write_event(event.clone())
+                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+
+                        // Empty tag is Start+End with no depth delta
+                        if name == &*self.message_element_bytes && depth == 0 {
+                            let xml_bytes = xml_writer.into_inner();
+                            let xml_str = String::from_utf8(xml_bytes).map_err(|e| {
+                                ConversionError::XmlParseError(format!(
+                                    "Invalid UTF-8 in XML message: {e}"
+                                ))
+                            })?;
+
+                            let json_value = self.xml_to_json_value(&xml_str)?;
+
+                            serde_json::to_writer(&mut *writer, &json_value).map_err(|e| {
+                                ConversionError::JsonSerializeError(e.to_string())
+                            })?;
+                            writer
+                                .write_all(b"\n")
+                                .map_err(|e| ConversionError::WriteError(e.to_string()))?;
+
+                            stats.messages_converted += 1;
+                            stats.bytes_processed += xml_str.len() as u64;
+
+                            inside_message = false;
+                            xml_writer = XmlWriter::new(Vec::new());
+                        }
                     }
                 }
-                Event::CData(ref e) => {
+
+                Event::Text(_)
+                | Event::CData(_)
+                | Event::Comment(_)
+                | Event::Decl(_)
+                | Event::PI(_) => {
                     if inside_message {
-                        xml_writer.write_event(Event::CData(e.clone()))?;
+                        xml_writer
+                            .write_event(event.clone())
+                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
                     }
                 }
-                Event::Empty(ref e) => {
-                    if inside_message {
-                        xml_writer.write_event(Event::Empty(e.clone()))?;
-                    }
-                }
-                Event::Eof => break,
+
+                // Catch-all for things like DocType etc.
                 _ => {
                     if inside_message {
-                        xml_writer.write_event(event.clone())?;
+                        xml_writer
+                            .write_event(event.clone())
+                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
                     }
                 }
             }
-
-            buf.clear();
         }
 
         Ok(stats)
     }
 
-    /// Convert a single XML message string to a JSON line
-    fn xml_to_json(&self, xml: &str) -> Result<String> {
-        // Extract root element name from the XML
+
+    fn xml_to_json_value(&self, xml: &str) -> Result<Value> {
         let root_name = self.extract_root_element_name(xml)?;
-        
-        // Parse the XML string into a serde_json::Value
-        // quick-xml deserializes without preserving the root element name
-        let inner_value: Value = quick_xml::de::from_str(xml).map_err(|e| {
-            ConversionError::XmlParseError(format!("Failed to deserialize XML: {}", e))
+
+        let mut inner_value: Value = quick_xml::de::from_str(xml).map_err(|e| {
+            ConversionError::XmlParseError(format!("Failed to deserialize XML: {e}"))
         })?;
 
-        // Unwrap $text fields that quick-xml adds
-        let cleaned_value = self.unwrap_text_fields(inner_value);
+        self.unwrap_text_fields_in_place(&mut inner_value);
 
-        // Wrap the value with the root element name to preserve structure
-        let wrapped = serde_json::json!({
-            root_name: cleaned_value
-        });
-
-        // Serialize to a compact JSON string (single line)
-        serde_json::to_string(&wrapped).map_err(|e| {
-            ConversionError::JsonSerializeError(format!("Failed to serialize JSON: {}", e))
-        })
+        Ok(serde_json::json!({ root_name: inner_value }))
     }
 
-    /// Recursively unwrap {"$text": "value"} into just "value"
-    fn unwrap_text_fields(&self, value: Value) -> Value {
+    fn unwrap_text_fields_in_place(&self, value: &mut Value) {
         match value {
-            Value::Object(mut map) => {
-                // If this object only has a "$text" field, return just that value
-                if map.len() == 1 && map.contains_key("$text") {
-                    return map.remove("$text").unwrap();
+            Value::Object(map) => {
+                // If object is exactly { "$text": <something> } then collapse to <something>
+                if map.len() == 1 {
+                    if let Some(v) = map.remove("$text") {
+                        *value = v;
+                        return;
+                    }
                 }
-                
-                // Otherwise, recursively process all fields
-                let cleaned: serde_json::Map<String, Value> = map
-                    .into_iter()
-                    .map(|(k, v)| (k, self.unwrap_text_fields(v)))
-                    .collect();
-                Value::Object(cleaned)
+
+                // Otherwise recurse into children
+                for v in map.values_mut() {
+                    self.unwrap_text_fields_in_place(v);
+                }
             }
             Value::Array(arr) => {
-                Value::Array(arr.into_iter().map(|v| self.unwrap_text_fields(v)).collect())
+                for v in arr.iter_mut() {
+                    self.unwrap_text_fields_in_place(v);
+                }
             }
-            other => other,
+            _ => {
+                // primitives: nothing to do
+            }
         }
     }
 
     /// Extract the root element name from XML
-    fn extract_root_element_name(&self, xml: &str) -> Result<String> {
-        let trimmed = xml.trim();
+    fn extract_root_element_name<'a>(&self, xml: &'a str) -> Result<&'a str> {
+        // Skip leading whitespace
+        let trimmed = xml.trim_start();
+
         if !trimmed.starts_with('<') {
             return Err(ConversionError::XmlParseError(
-                "Invalid XML: does not start with <".to_string(),
+                "XML does not start with '<'".to_string(),
             ));
         }
 
-        // Find the end of the opening tag name
-        let start = 1; // Skip the '<'
-        let end = trimmed[start..]
-            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-            .map(|i| i + start)
-            .unwrap_or(trimmed.len());
+        // We assume element names are ASCII (standard XML rules).
+        let bytes = trimmed.as_bytes();
+        let mut i: usize = 1; // skip '<'
 
-        Ok(trimmed[start..end].to_string())
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_whitespace() || c == '>' || c == '/' {
+                break;
+            }
+            i += 1;
+        }
+
+        if i <= 1 {
+            return Err(ConversionError::XmlParseError(
+                "Could not extract root element name".to_string(),
+            ));
+        }
+
+        Ok(&trimmed[1..i])
     }
 }
 
@@ -466,14 +546,13 @@ mod tests {
         let converter = Converter::new(ConverterConfig::default());
 
         let xml = r#"<trade><id>123</id><amount>100.50</amount></trade>"#;
-        let json = converter.xml_to_json(xml).unwrap();
+        let value = converter.xml_to_json_value(xml).unwrap();
 
-        // Should be valid JSON
-        let parsed: Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.is_object());
-        
-        // Check structure - root element should be preserved
-        assert!(parsed.get("trade").is_some());
+        // Should be a JSON object
+        assert!(value.is_object());
+
+        // Root element should be preserved
+        assert!(value.get("trade").is_some());
     }
 
     #[test]
@@ -481,12 +560,11 @@ mod tests {
         let converter = Converter::new(ConverterConfig::default());
 
         let xml = r#"<trade><id>123</id><trader><name>John</name><desk>Equities</desk></trader></trade>"#;
-        let json = converter.xml_to_json(xml).unwrap();
+        let value = converter.xml_to_json_value(xml).unwrap();
 
-        let parsed: Value = serde_json::from_str(&json).unwrap();
         // Should be clean JSON without $text wrappers
-        assert_eq!(parsed["trade"]["trader"]["name"], "John");
-        assert_eq!(parsed["trade"]["id"], "123");
+        assert_eq!(value["trade"]["trader"]["name"], "John");
+        assert_eq!(value["trade"]["id"], "123");
     }
 
     #[test]
@@ -494,10 +572,11 @@ mod tests {
         let converter = Converter::new(ConverterConfig::default());
 
         let xml = r#"<trade id="123"><symbol>AAPL</symbol></trade>"#;
-        let json = converter.xml_to_json(xml).unwrap();
+        let value = converter.xml_to_json_value(xml).unwrap();
 
-        let parsed: Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.is_object());
+        // Just assert it's a sensible object; attribute handling is up to quick_xml::de
+        assert!(value.is_object());
+        assert!(value.get("trade").is_some());
     }
 
     #[test]
@@ -505,7 +584,7 @@ mod tests {
         let converter = Converter::new(ConverterConfig::default());
 
         let xml = r#"<trade><unclosed>"#;
-        let result = converter.xml_to_json(xml);
+        let result = converter.xml_to_json_value(xml);
 
         assert!(result.is_err());
     }
