@@ -12,6 +12,9 @@ use rayon::prelude::*;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use serde::ser::SerializeMap;
+use serde::ser::Serializer;
+use serde_json::ser::Serializer as JsonSerializer;
 
 // Buffer size constants for optimization
 const XML_BUFFER_CAPACITY: usize = 32768;
@@ -321,7 +324,11 @@ impl Converter {
                             let bytes_processed = xml_buffer.len() as u64;
 
                             output_buffer.clear();
-                            self.xml_to_json_optimized(&xml_buffer, &mut output_buffer)?;
+                            self.xml_to_json_optimized(
+                                &self.config.message_element,
+                                &xml_buffer,
+                                &mut output_buffer,
+                            )?;
 
                             writer.write_all(&output_buffer)?;
                             writer.write_all(b"\n")?;
@@ -359,7 +366,11 @@ impl Converter {
                             let bytes_processed = xml_buffer.len() as u64;
 
                             output_buffer.clear();
-                            self.xml_to_json_optimized(&xml_buffer, &mut output_buffer)?;
+                            self.xml_to_json_optimized(
+                                &self.config.message_element,
+                                &xml_buffer,
+                                &mut output_buffer,
+                            )?;
 
                             writer.write_all(&output_buffer)?;
                             writer.write_all(b"\n")?;
@@ -398,32 +409,32 @@ impl Converter {
 
     /// Optimized XML to JSON conversion that writes directly to output buffer
     /// Minimizes intermediate allocations and conversions
-    fn xml_to_json_optimized(&self, xml_bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
-        let root_name = self.extract_root_element_name_from_bytes(xml_bytes)?;
-
+    fn xml_to_json_optimized(
+        &self,
+        root_name: &str,
+        xml_bytes: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
         let xml_str = std::str::from_utf8(xml_bytes)
-            .map_err(|e| ConversionError::XmlParseError(format!("Invalid UTF-8: {}", e)))?;
+            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
 
-        let mut inner_value: Value = quick_xml::de::from_str(xml_str).map_err(|e| {
-            ConversionError::XmlParseError(format!("Failed to deserialize XML: {}", e))
-        })?;
+        let mut inner_value: Value = quick_xml::de::from_str(xml_str)
+            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
 
         self.unwrap_text_fields_in_place(&mut inner_value);
 
         output.clear();
 
-        // { "root_name":
-        output.push(b'{');
-        // JSON-escape the key correctly
-        serde_json::to_writer(&mut *output, root_name)
-            .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
-        output.push(b':');
-
-        // value
-        serde_json::to_writer(&mut *output, &inner_value)
+        let mut ser = JsonSerializer::new(&mut *output);
+        let mut map = ser
+            .serialize_map(Some(1))
             .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
 
-        output.push(b'}');
+        // key: root_name, value: inner_value
+        map.serialize_entry(root_name, &inner_value)
+            .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
+        map.end()
+            .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
 
         Ok(())
     }
@@ -454,41 +465,8 @@ impl Converter {
             }
         }
     }
-
-    /// Extract the root element name from XML bytes (optimized version)
-    fn extract_root_element_name_from_bytes<'a>(&self, xml: &'a [u8]) -> Result<&'a str> {
-        // Skip leading whitespace
-        let mut start = 0;
-        while start < xml.len() && xml[start].is_ascii_whitespace() {
-            start += 1;
-        }
-
-        if start >= xml.len() || xml[start] != b'<' {
-            return Err(ConversionError::XmlParseError(
-                "XML does not start with '<'".to_string(),
-            ));
-        }
-
-        let mut i = start + 1;
-        while i < xml.len() {
-            let c = xml[i];
-            if c.is_ascii_whitespace() || c == b'>' || c == b'/' {
-                break;
-            }
-            i += 1;
-        }
-
-        if i <= start + 1 {
-            return Err(ConversionError::XmlParseError(
-                "Could not extract root element name".to_string(),
-            ));
-        }
-
-        std::str::from_utf8(&xml[start + 1..i]).map_err(|e| {
-            ConversionError::XmlParseError(format!("Invalid UTF-8 in element name: {}", e))
-        })
-    }
 }
+
 
 /// Statistics for a single file conversion
 #[derive(Debug, Default)]
@@ -646,32 +624,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(stats.messages_converted, 2);
-    }
-
-    #[test]
-    fn test_extract_root_element_name_from_bytes() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        assert_eq!(
-            converter
-                .extract_root_element_name_from_bytes(b"<trade></trade>")
-                .unwrap(),
-            "trade"
-        );
-
-        assert_eq!(
-            converter
-                .extract_root_element_name_from_bytes(b"<trade id=\"123\"></trade>")
-                .unwrap(),
-            "trade"
-        );
-
-        assert_eq!(
-            converter
-                .extract_root_element_name_from_bytes(b"  <message>  ")
-                .unwrap(),
-            "message"
-        );
     }
 
     #[test]
