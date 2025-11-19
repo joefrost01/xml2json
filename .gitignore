@@ -1,3 +1,9 @@
 /Cargo.lock
 /target/
 /output/
+/.idea/
+/bench-10m/
+/output-10m/
+.idea/modules.xml
+.idea/vcs.xml
+.idea/xml2json.iml
