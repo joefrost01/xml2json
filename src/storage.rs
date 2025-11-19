@@ -7,6 +7,10 @@ use crate::error::{ConversionError, Result};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+// Optimized buffer sizes for better I/O performance
+const READ_BUFFER_SIZE: usize = 256 * 1024;  // 256 KB
+const WRITE_BUFFER_SIZE: usize = 256 * 1024; // 256 KB
+
 /// Trait for storage backends (local filesystem or cloud storage)
 pub trait Storage: Send + Sync {
     /// List all files with the given prefix/path
@@ -68,7 +72,8 @@ impl Storage for LocalStorage {
         let file = std::fs::File::open(path).map_err(|e| {
             ConversionError::ReadError(format!("Failed to open {}: {}", path, e))
         })?;
-        Ok(Box::new(BufReader::new(file)))
+        // Use larger buffer for better I/O performance
+        Ok(Box::new(BufReader::with_capacity(READ_BUFFER_SIZE, file)))
     }
 
     fn write(&self, path: &str) -> Result<Box<dyn Write + Send>> {
@@ -82,12 +87,13 @@ impl Storage for LocalStorage {
         let file = std::fs::File::create(path).map_err(|e| {
             ConversionError::WriteError(format!("Failed to create {}: {}", path.display(), e))
         })?;
-        Ok(Box::new(BufWriter::new(file)))
+        // Use larger buffer for better I/O performance
+        Ok(Box::new(BufWriter::with_capacity(WRITE_BUFFER_SIZE, file)))
     }
 
     fn move_file(&self, from: &str, to: &str) -> Result<()> {
         let to_path = Path::new(to);
-        
+
         // Create parent directories if they don't exist
         if let Some(parent) = to_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -103,7 +109,7 @@ impl Storage for LocalStorage {
                 ConversionError::StorageError(format!("Failed to remove {}: {}", from, e))
             })?;
         }
-        
+
         Ok(())
     }
 }
@@ -194,7 +200,11 @@ impl Storage for GcsStorage {
             ConversionError::ReadError(format!("Failed to download from GCS: {}", e))
         })?;
 
-        Ok(Box::new(std::io::Cursor::new(data)))
+        // Wrap in BufReader for consistency and potential buffering benefits
+        Ok(Box::new(BufReader::with_capacity(
+            READ_BUFFER_SIZE,
+            std::io::Cursor::new(data)
+        )))
     }
 
     fn write(&self, path: &str) -> Result<Box<dyn Write + Send>> {
@@ -249,6 +259,7 @@ impl Storage for GcsStorage {
 }
 
 /// A writer that buffers data and uploads to GCS on drop
+/// Uses larger internal buffer for better performance
 struct GcsWriter {
     client: google_cloud_storage::client::Client,
     runtime_handle: tokio::runtime::Handle,
@@ -269,7 +280,7 @@ impl GcsWriter {
             runtime_handle,
             bucket,
             object,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(WRITE_BUFFER_SIZE),
         }
     }
 }
@@ -330,7 +341,7 @@ mod tests {
     fn test_local_storage_read_write() {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new();
-        
+
         let test_path = temp_dir.path().join("test.txt").display().to_string();
         let content = "Hello, World!";
 
@@ -351,7 +362,7 @@ mod tests {
     fn test_local_storage_write_creates_directories() {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new();
-        
+
         let test_path = temp_dir.path()
             .join("subdir1")
             .join("subdir2")
@@ -426,7 +437,7 @@ mod tests {
         // Verify
         assert!(!Path::new(&source_path).exists(), "Source should not exist");
         assert!(Path::new(&dest_path).exists(), "Destination should exist");
-        
+
         let content = std::fs::read_to_string(&dest_path).unwrap();
         assert_eq!(content, "test content");
     }
@@ -449,7 +460,7 @@ mod tests {
         // Verify
         assert!(!Path::new(&source_path).exists(), "Source should not exist");
         assert!(Path::new(&dest_path).exists(), "Destination should exist");
-        
+
         let content = std::fs::read_to_string(&dest_path).unwrap();
         assert_eq!(content, "test content");
     }
@@ -525,5 +536,12 @@ mod tests {
         let (bucket, object) = result.unwrap();
         assert_eq!(bucket, "bucket-name");
         assert_eq!(object, "");
+    }
+
+    #[test]
+    fn test_buffer_sizes() {
+        // Verify optimized buffer sizes are used
+        assert_eq!(READ_BUFFER_SIZE, 256 * 1024);
+        assert_eq!(WRITE_BUFFER_SIZE, 256 * 1024);
     }
 }

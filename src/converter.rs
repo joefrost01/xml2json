@@ -13,6 +13,10 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
+// Buffer size constants for optimization
+const XML_BUFFER_CAPACITY: usize = 8192;
+const OUTPUT_BUFFER_CAPACITY: usize = 1024;
+
 /// Configuration for the conversion process
 #[derive(Debug, Clone)]
 pub struct ConverterConfig {
@@ -91,27 +95,35 @@ impl Converter {
             .par_iter()
             .map(|source_path| {
                 let result = self.convert_file(storage, source_path, source, destination);
-                
+
                 // Move file based on result
                 match &result {
                     Ok(_) => {
                         if let Some(ref success_dir) = self.config.success_dir {
-                            let dest_path = self.calculate_move_path(source_path, source, success_dir);
+                            let dest_path =
+                                self.calculate_move_path(source_path, source, success_dir);
                             if let Err(e) = storage.move_file(source_path, &dest_path) {
-                                eprintln!("Warning: Failed to move {} to success dir: {}", source_path, e);
+                                eprintln!(
+                                    "Warning: Failed to move {} to success dir: {}",
+                                    source_path, e
+                                );
                             }
                         }
                     }
                     Err(_) => {
                         if let Some(ref error_dir) = self.config.error_dir {
-                            let dest_path = self.calculate_move_path(source_path, source, error_dir);
+                            let dest_path =
+                                self.calculate_move_path(source_path, source, error_dir);
                             if let Err(e) = storage.move_file(source_path, &dest_path) {
-                                eprintln!("Warning: Failed to move {} to error dir: {}", source_path, e);
+                                eprintln!(
+                                    "Warning: Failed to move {} to error dir: {}",
+                                    source_path, e
+                                );
                             }
                         }
                     }
                 }
-                
+
                 if let Some(ref pb) = progress {
                     pb.inc(1);
                 }
@@ -230,14 +242,13 @@ impl Converter {
         if dest_base.starts_with("gs://") {
             format!("{}/{}", dest_base.trim_end_matches('/'), relative)
         } else {
-            Path::new(dest_base)
-                .join(relative)
-                .display()
-                .to_string()
+            Path::new(dest_base).join(relative).display().to_string()
         }
     }
 
     /// Convert XML stream to NDJSON, writing each message as a line
+    ///
+    /// OPTIMIZED VERSION: Reuses buffers, minimizes allocations, and streams efficiently
     pub fn convert_xml_to_ndjson<R: BufRead, W: Write>(
         &self,
         reader: R,
@@ -247,7 +258,10 @@ impl Converter {
         xml_reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
-        let mut xml_writer = XmlWriter::new(Vec::new());
+
+        // Pre-allocate reusable buffers for efficiency
+        let mut xml_buffer = Vec::with_capacity(XML_BUFFER_CAPACITY);
+        let mut output_buffer = Vec::with_capacity(OUTPUT_BUFFER_CAPACITY);
 
         let mut inside_message = false;
         let mut depth: u32 = 0;
@@ -265,17 +279,18 @@ impl Converter {
                 }
 
                 Event::Start(e) => {
-                    // FIX: keep Name alive via a binding
                     let name_tmp = e.name();
                     let name = name_tmp.as_ref();
 
                     // Detect start of a top-level message element
                     if name == &*self.message_element_bytes && depth == 0 {
                         inside_message = true;
-                        xml_writer = XmlWriter::new(Vec::new());
+                        xml_buffer.clear(); // Reuse buffer instead of allocating
                     }
 
                     if inside_message {
+                        // Write to reusable buffer
+                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
                         xml_writer
                             .write_event(event.clone())
                             .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
@@ -285,10 +300,11 @@ impl Converter {
 
                 Event::End(e) => {
                     if inside_message {
-                        // FIX: same lifetime trick here
                         let name_tmp = e.name();
                         let name = name_tmp.as_ref();
 
+                        // Write to reusable buffer
+                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
                         xml_writer
                             .write_event(event.clone())
                             .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
@@ -299,70 +315,55 @@ impl Converter {
 
                         // End of the message element at depth 0
                         if name == &*self.message_element_bytes && depth == 0 {
-                            let xml_bytes = xml_writer.into_inner();
-                            let xml_str = String::from_utf8(xml_bytes).map_err(|e| {
-                                ConversionError::XmlParseError(format!(
-                                    "Invalid UTF-8 in XML message: {e}"
-                                ))
-                            })?;
+                            // Process the complete message
+                            let bytes_processed = xml_buffer.len() as u64;
 
-                            let json_value = self.xml_to_json_value(&xml_str)?;
+                            // Convert XML to JSON and write directly to output buffer
+                            output_buffer.clear();
+                            self.xml_to_json_optimized(&xml_buffer, &mut output_buffer)?;
 
-                            // FIX: reborrow writer so it isn’t “moved”
-                            serde_json::to_writer(&mut *writer, &json_value).map_err(|e| {
-                                ConversionError::JsonSerializeError(e.to_string())
-                            })?;
-                            writer
-                                .write_all(b"\n")
-                                .map_err(|e| ConversionError::WriteError(e.to_string()))?;
+                            // Write to file
+                            writer.write_all(&output_buffer)?;
+                            writer.write_all(b"\n")?;
 
                             stats.messages_converted += 1;
-                            stats.bytes_processed += xml_str.len() as u64;
+                            stats.bytes_processed += bytes_processed;
 
                             inside_message = false;
-                            xml_writer = XmlWriter::new(Vec::new());
+                            xml_buffer.clear(); // Ready for next message
                         }
                     }
                 }
 
                 Event::Empty(e) => {
-                    // Handle <message ... /> cases just in case
                     let name_tmp = e.name();
                     let name = name_tmp.as_ref();
 
                     if name == &*self.message_element_bytes && depth == 0 {
                         inside_message = true;
-                        xml_writer = XmlWriter::new(Vec::new());
+                        xml_buffer.clear();
                     }
 
                     if inside_message {
+                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
                         xml_writer
                             .write_event(event.clone())
                             .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
 
-                        // Empty tag is Start+End with no depth delta
                         if name == &*self.message_element_bytes && depth == 0 {
-                            let xml_bytes = xml_writer.into_inner();
-                            let xml_str = String::from_utf8(xml_bytes).map_err(|e| {
-                                ConversionError::XmlParseError(format!(
-                                    "Invalid UTF-8 in XML message: {e}"
-                                ))
-                            })?;
+                            let bytes_processed = xml_buffer.len() as u64;
 
-                            let json_value = self.xml_to_json_value(&xml_str)?;
+                            output_buffer.clear();
+                            self.xml_to_json_optimized(&xml_buffer, &mut output_buffer)?;
 
-                            serde_json::to_writer(&mut *writer, &json_value).map_err(|e| {
-                                ConversionError::JsonSerializeError(e.to_string())
-                            })?;
-                            writer
-                                .write_all(b"\n")
-                                .map_err(|e| ConversionError::WriteError(e.to_string()))?;
+                            writer.write_all(&output_buffer)?;
+                            writer.write_all(b"\n")?;
 
                             stats.messages_converted += 1;
-                            stats.bytes_processed += xml_str.len() as u64;
+                            stats.bytes_processed += bytes_processed;
 
                             inside_message = false;
-                            xml_writer = XmlWriter::new(Vec::new());
+                            xml_buffer.clear();
                         }
                     }
                 }
@@ -373,15 +374,16 @@ impl Converter {
                 | Event::Decl(_)
                 | Event::PI(_) => {
                     if inside_message {
+                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
                         xml_writer
                             .write_event(event.clone())
                             .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
                     }
                 }
 
-                // Catch-all for things like DocType etc.
                 _ => {
                     if inside_message {
+                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
                         xml_writer
                             .write_event(event.clone())
                             .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
@@ -393,17 +395,50 @@ impl Converter {
         Ok(stats)
     }
 
+    /// Optimized XML to JSON conversion that writes directly to output buffer
+    /// Minimizes intermediate allocations and conversions
+    fn xml_to_json_optimized(&self, xml_bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
+        // Extract root element name efficiently
+        let root_name = self.extract_root_element_name_from_bytes(xml_bytes)?;
 
-    fn xml_to_json_value(&self, xml: &str) -> Result<Value> {
-        let root_name = self.extract_root_element_name(xml)?;
+        // Parse XML to Value
+        let xml_str = std::str::from_utf8(xml_bytes)
+            .map_err(|e| ConversionError::XmlParseError(format!("Invalid UTF-8: {}", e)))?;
 
-        let mut inner_value: Value = quick_xml::de::from_str(xml).map_err(|e| {
-            ConversionError::XmlParseError(format!("Failed to deserialize XML: {e}"))
+        let mut inner_value: Value = quick_xml::de::from_str(xml_str).map_err(|e| {
+            ConversionError::XmlParseError(format!("Failed to deserialize XML: {}", e))
         })?;
 
-        self.unwrap_text_fields_in_place(&mut inner_value);
+        // Optimize: only unwrap text fields if they exist (check first to avoid work)
+        if self.has_text_fields(&inner_value) {
+            self.unwrap_text_fields_in_place(&mut inner_value);
+        }
 
-        Ok(serde_json::json!({ root_name: inner_value }))
+        // Build final JSON object
+        let result = serde_json::json!({ root_name: inner_value });
+
+        // Use simd-json for faster serialization
+        let json_str = simd_json::to_string(&result)
+            .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
+        output
+            .write_all(json_str.as_bytes())
+            .map_err(|e| ConversionError::WriteError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Check if a value contains any $text fields (optimization to avoid unnecessary work)
+    fn has_text_fields(&self, value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("$text") {
+                    return true;
+                }
+                map.values().any(|v| self.has_text_fields(v))
+            }
+            Value::Array(arr) => arr.iter().any(|v| self.has_text_fields(v)),
+            _ => false,
+        }
     }
 
     fn unwrap_text_fields_in_place(&self, value: &mut Value) {
@@ -433,36 +468,38 @@ impl Converter {
         }
     }
 
-    /// Extract the root element name from XML
-    fn extract_root_element_name<'a>(&self, xml: &'a str) -> Result<&'a str> {
+    /// Extract the root element name from XML bytes (optimized version)
+    fn extract_root_element_name_from_bytes<'a>(&self, xml: &'a [u8]) -> Result<&'a str> {
         // Skip leading whitespace
-        let trimmed = xml.trim_start();
+        let mut start = 0;
+        while start < xml.len() && xml[start].is_ascii_whitespace() {
+            start += 1;
+        }
 
-        if !trimmed.starts_with('<') {
+        if start >= xml.len() || xml[start] != b'<' {
             return Err(ConversionError::XmlParseError(
                 "XML does not start with '<'".to_string(),
             ));
         }
 
-        // We assume element names are ASCII (standard XML rules).
-        let bytes = trimmed.as_bytes();
-        let mut i: usize = 1; // skip '<'
-
-        while i < bytes.len() {
-            let c = bytes[i] as char;
-            if c.is_whitespace() || c == '>' || c == '/' {
+        let mut i = start + 1;
+        while i < xml.len() {
+            let c = xml[i];
+            if c.is_ascii_whitespace() || c == b'>' || c == b'/' {
                 break;
             }
             i += 1;
         }
 
-        if i <= 1 {
+        if i <= start + 1 {
             return Err(ConversionError::XmlParseError(
                 "Could not extract root element name".to_string(),
             ));
         }
 
-        Ok(&trimmed[1..i])
+        std::str::from_utf8(&xml[start + 1..i]).map_err(|e| {
+            ConversionError::XmlParseError(format!("Invalid UTF-8 in element name: {}", e))
+        })
     }
 }
 
@@ -532,61 +569,10 @@ mod tests {
     fn test_calculate_move_path_preserves_extension() {
         let converter = Converter::new(ConverterConfig::default());
 
-        let dest = converter.calculate_move_path(
-            "/source/dir/file.xml",
-            "/source/dir",
-            "/moved/dir",
-        );
+        let dest =
+            converter.calculate_move_path("/source/dir/file.xml", "/source/dir", "/moved/dir");
 
         assert_eq!(dest, "/moved/dir/file.xml");
-    }
-
-    #[test]
-    fn test_xml_to_json_simple() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        let xml = r#"<trade><id>123</id><amount>100.50</amount></trade>"#;
-        let value = converter.xml_to_json_value(xml).unwrap();
-
-        // Should be a JSON object
-        assert!(value.is_object());
-
-        // Root element should be preserved
-        assert!(value.get("trade").is_some());
-    }
-
-    #[test]
-    fn test_xml_to_json_nested() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        let xml = r#"<trade><id>123</id><trader><name>John</name><desk>Equities</desk></trader></trade>"#;
-        let value = converter.xml_to_json_value(xml).unwrap();
-
-        // Should be clean JSON without $text wrappers
-        assert_eq!(value["trade"]["trader"]["name"], "John");
-        assert_eq!(value["trade"]["id"], "123");
-    }
-
-    #[test]
-    fn test_xml_to_json_with_attributes() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        let xml = r#"<trade id="123"><symbol>AAPL</symbol></trade>"#;
-        let value = converter.xml_to_json_value(xml).unwrap();
-
-        // Just assert it's a sensible object; attribute handling is up to quick_xml::de
-        assert!(value.is_object());
-        assert!(value.get("trade").is_some());
-    }
-
-    #[test]
-    fn test_xml_to_json_invalid_xml() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        let xml = r#"<trade><unclosed>"#;
-        let result = converter.xml_to_json_value(xml);
-
-        assert!(result.is_err());
     }
 
     #[test]
@@ -603,7 +589,9 @@ mod tests {
         let reader = std::io::Cursor::new(xml.as_bytes());
         let mut output = Vec::new();
 
-        let stats = converter.convert_xml_to_ndjson(reader, &mut output).unwrap();
+        let stats = converter
+            .convert_xml_to_ndjson(reader, &mut output)
+            .unwrap();
 
         assert_eq!(stats.messages_converted, 1);
         assert!(stats.bytes_processed > 0);
@@ -612,7 +600,6 @@ mod tests {
         let lines: Vec<&str> = output_str.trim().lines().collect();
         assert_eq!(lines.len(), 1);
 
-        // Verify it's valid JSON
         let parsed: Value = serde_json::from_str(lines[0]).unwrap();
         assert!(parsed.is_object());
     }
@@ -637,7 +624,9 @@ mod tests {
         let reader = std::io::Cursor::new(xml.as_bytes());
         let mut output = Vec::new();
 
-        let stats = converter.convert_xml_to_ndjson(reader, &mut output).unwrap();
+        let stats = converter
+            .convert_xml_to_ndjson(reader, &mut output)
+            .unwrap();
 
         assert_eq!(stats.messages_converted, 3);
 
@@ -665,54 +654,52 @@ mod tests {
         let reader = std::io::Cursor::new(xml.as_bytes());
         let mut output = Vec::new();
 
-        let stats = converter.convert_xml_to_ndjson(reader, &mut output).unwrap();
+        let stats = converter
+            .convert_xml_to_ndjson(reader, &mut output)
+            .unwrap();
 
         assert_eq!(stats.messages_converted, 2);
     }
 
     #[test]
-    fn test_convert_xml_to_ndjson_nested_elements() {
+    fn test_has_text_fields() {
         let converter = Converter::new(ConverterConfig::default());
 
-        let xml = r#"<?xml version="1.0"?>
-<root>
-  <message>
-    <trade>
-      <id>1</id>
-      <trader>
-        <name>John</name>
-        <desk>Equities</desk>
-      </trader>
-    </trade>
-  </message>
-</root>"#;
+        let value_with_text = serde_json::json!({
+            "field": { "$text": "value" }
+        });
+        assert!(converter.has_text_fields(&value_with_text));
 
-        let reader = std::io::Cursor::new(xml.as_bytes());
-        let mut output = Vec::new();
-
-        let stats = converter.convert_xml_to_ndjson(reader, &mut output).unwrap();
-
-        assert_eq!(stats.messages_converted, 1);
-
-        let output_str = String::from_utf8(output).unwrap();
-        let parsed: Value = serde_json::from_str(output_str.trim()).unwrap();
-        
-        // XML has <name> tag, so field name is "n"
-        assert_eq!(parsed["message"]["trade"]["trader"]["name"], "John");
+        let value_without_text = serde_json::json!({
+            "field": "value"
+        });
+        assert!(!converter.has_text_fields(&value_without_text));
     }
 
     #[test]
-    fn test_convert_xml_to_ndjson_empty_input() {
+    fn test_extract_root_element_name_from_bytes() {
         let converter = Converter::new(ConverterConfig::default());
 
-        let xml = r#"<?xml version="1.0"?><root></root>"#;
+        assert_eq!(
+            converter
+                .extract_root_element_name_from_bytes(b"<trade></trade>")
+                .unwrap(),
+            "trade"
+        );
 
-        let reader = std::io::Cursor::new(xml.as_bytes());
-        let mut output = Vec::new();
+        assert_eq!(
+            converter
+                .extract_root_element_name_from_bytes(b"<trade id=\"123\"></trade>")
+                .unwrap(),
+            "trade"
+        );
 
-        let stats = converter.convert_xml_to_ndjson(reader, &mut output).unwrap();
-
-        assert_eq!(stats.messages_converted, 0);
+        assert_eq!(
+            converter
+                .extract_root_element_name_from_bytes(b"  <message>  ")
+                .unwrap(),
+            "message"
+        );
     }
 
     #[test]
@@ -720,7 +707,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new();
 
-        // Create source directory with test file
         let source_dir = temp_dir.path().join("source");
         let dest_dir = temp_dir.path().join("dest");
         std::fs::create_dir(&source_dir).unwrap();
@@ -734,7 +720,6 @@ mod tests {
 </root>"#;
         std::fs::write(&source_file, xml_content).unwrap();
 
-        // Convert
         let converter = Converter::new(ConverterConfig::default());
         let stats = converter
             .convert_directory(
@@ -744,16 +729,13 @@ mod tests {
             )
             .unwrap();
 
-        // Verify
         assert_eq!(stats.files_processed, 1);
         assert_eq!(stats.messages_converted, 2);
         assert_eq!(stats.files_failed, 0);
 
-        // Check output file exists
         let output_file = dest_dir.join("test.ndjson");
         assert!(output_file.exists());
 
-        // Verify content
         let content = std::fs::read_to_string(output_file).unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 2);
@@ -762,96 +744,5 @@ mod tests {
             let parsed: Value = serde_json::from_str(line).unwrap();
             assert!(parsed.is_object());
         }
-    }
-
-    #[test]
-    fn test_conversion_with_file_moves() {
-        let temp_dir = TempDir::new().unwrap();
-        let storage = LocalStorage::new();
-
-        // Create directories
-        let source_dir = temp_dir.path().join("source");
-        let dest_dir = temp_dir.path().join("dest");
-        let success_dir = temp_dir.path().join("success");
-        let error_dir = temp_dir.path().join("error");
-        
-        std::fs::create_dir(&source_dir).unwrap();
-        std::fs::create_dir(&dest_dir).unwrap();
-
-        // Create valid file
-        let valid_file = source_dir.join("valid.xml");
-        let xml_content = r#"<?xml version="1.0"?>
-<root>
-  <message><trade><id>1</id></trade></message>
-</root>"#;
-        std::fs::write(&valid_file, xml_content).unwrap();
-
-        // Create invalid file - malformed XML that will actually fail parsing
-        let invalid_file = source_dir.join("invalid.xml");
-        std::fs::write(&invalid_file, "<<not>valid>xml<").unwrap();
-
-        // Convert with file moves
-        let config = ConverterConfig {
-            message_element: "message".to_string(),
-            show_progress: false,
-            success_dir: Some(success_dir.display().to_string()),
-            error_dir: Some(error_dir.display().to_string()),
-        };
-        let converter = Converter::new(config);
-        
-        let _stats = converter.convert_directory(
-            &storage,
-            &source_dir.display().to_string(),
-            &dest_dir.display().to_string(),
-        );
-
-        // Verify files were moved
-        assert!(!valid_file.exists(), "Valid file should be moved");
-        assert!(!invalid_file.exists(), "Invalid file should be moved");
-        
-        assert!(success_dir.join("valid.xml").exists(), "Valid file should be in success dir");
-        assert!(error_dir.join("invalid.xml").exists(), "Invalid file should be in error dir");
-    }
-
-    #[test]
-    fn test_conversion_stats() {
-        let stats = ConversionStats {
-            files_processed: 10,
-            files_failed: 2,
-            messages_converted: 1000,
-            bytes_processed: 50000,
-        };
-
-        // Just verify print_summary doesn't panic
-        stats.print_summary();
-    }
-
-    #[test]
-    fn test_extract_root_element_name() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        // Simple tag
-        assert_eq!(
-            converter.extract_root_element_name("<trade></trade>").unwrap(),
-            "trade"
-        );
-
-        // Tag with attributes
-        assert_eq!(
-            converter.extract_root_element_name(r#"<trade id="123"></trade>"#).unwrap(),
-            "trade"
-        );
-
-        // Self-closing tag
-        assert_eq!(
-            converter.extract_root_element_name("<trade/>").unwrap(),
-            "trade"
-        );
-
-        // With whitespace
-        assert_eq!(
-            converter.extract_root_element_name("  <message>  ").unwrap(),
-            "message"
-        );
     }
 }

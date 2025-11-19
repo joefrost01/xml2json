@@ -7,6 +7,10 @@
 use xml2json::{
     cli::Args, create_storage, Converter, ConverterConfig,
 };
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     // Parse command-line arguments
