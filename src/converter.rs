@@ -14,8 +14,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 // Buffer size constants for optimization
-const XML_BUFFER_CAPACITY: usize = 8192;
-const OUTPUT_BUFFER_CAPACITY: usize = 1024;
+const XML_BUFFER_CAPACITY: usize = 32768;
+const OUTPUT_BUFFER_CAPACITY: usize = 32768;
 
 /// Configuration for the conversion process
 #[derive(Debug, Clone)]
@@ -267,6 +267,9 @@ impl Converter {
         let mut depth: u32 = 0;
         let mut stats = FileStats::default();
 
+        // Writer that borrows xml_buffer while we’re inside a message
+        let mut xml_writer: Option<XmlWriter<&mut Vec<u8>>> = None;
+
         loop {
             buf.clear();
             let event = xml_reader
@@ -274,26 +277,24 @@ impl Converter {
                 .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
 
             match &event {
-                Event::Eof => {
-                    break;
-                }
+                Event::Eof => break,
 
                 Event::Start(e) => {
                     let name_tmp = e.name();
                     let name = name_tmp.as_ref();
 
-                    // Detect start of a top-level message element
                     if name == &*self.message_element_bytes && depth == 0 {
                         inside_message = true;
-                        xml_buffer.clear(); // Reuse buffer instead of allocating
+                        xml_buffer.clear();
+                        xml_writer = Some(XmlWriter::new(&mut xml_buffer));
                     }
 
                     if inside_message {
-                        // Write to reusable buffer
-                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
-                        xml_writer
-                            .write_event(event.clone())
-                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        if let Some(writer) = xml_writer.as_mut() {
+                            writer
+                                .write_event(event.clone())
+                                .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        }
                         depth += 1;
                     }
                 }
@@ -303,26 +304,25 @@ impl Converter {
                         let name_tmp = e.name();
                         let name = name_tmp.as_ref();
 
-                        // Write to reusable buffer
-                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
-                        xml_writer
-                            .write_event(event.clone())
-                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        if let Some(writer) = xml_writer.as_mut() {
+                            writer
+                                .write_event(event.clone())
+                                .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        }
 
                         if depth > 0 {
                             depth -= 1;
                         }
 
-                        // End of the message element at depth 0
                         if name == &*self.message_element_bytes && depth == 0 {
-                            // Process the complete message
+                            // Drop writer so &mut xml_buffer is released
+                            xml_writer = None;
+
                             let bytes_processed = xml_buffer.len() as u64;
 
-                            // Convert XML to JSON and write directly to output buffer
                             output_buffer.clear();
                             self.xml_to_json_optimized(&xml_buffer, &mut output_buffer)?;
 
-                            // Write to file
                             writer.write_all(&output_buffer)?;
                             writer.write_all(b"\n")?;
 
@@ -330,7 +330,7 @@ impl Converter {
                             stats.bytes_processed += bytes_processed;
 
                             inside_message = false;
-                            xml_buffer.clear(); // Ready for next message
+                            xml_buffer.clear();
                         }
                     }
                 }
@@ -342,15 +342,20 @@ impl Converter {
                     if name == &*self.message_element_bytes && depth == 0 {
                         inside_message = true;
                         xml_buffer.clear();
+                        xml_writer = Some(XmlWriter::new(&mut xml_buffer));
                     }
 
                     if inside_message {
-                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
-                        xml_writer
-                            .write_event(event.clone())
-                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        if let Some(writer) = xml_writer.as_mut() {
+                            writer
+                                .write_event(event.clone())
+                                .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        }
 
+                        // For an empty element, depth doesn’t change, but this might be a whole message
                         if name == &*self.message_element_bytes && depth == 0 {
+                            xml_writer = None;
+
                             let bytes_processed = xml_buffer.len() as u64;
 
                             output_buffer.clear();
@@ -374,34 +379,28 @@ impl Converter {
                 | Event::Decl(_)
                 | Event::PI(_) => {
                     if inside_message {
-                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
-                        xml_writer
-                            .write_event(event.clone())
-                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        if let Some(writer) = xml_writer.as_mut() {
+                            writer
+                                .write_event(event.clone())
+                                .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+                        }
                     }
                 }
 
-                _ => {
-                    if inside_message {
-                        let mut xml_writer = XmlWriter::new(&mut xml_buffer);
-                        xml_writer
-                            .write_event(event.clone())
-                            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
-                    }
-                }
+                _ => {}
             }
         }
 
         Ok(stats)
     }
 
+
+
     /// Optimized XML to JSON conversion that writes directly to output buffer
     /// Minimizes intermediate allocations and conversions
     fn xml_to_json_optimized(&self, xml_bytes: &[u8], output: &mut Vec<u8>) -> Result<()> {
-        // Extract root element name efficiently
         let root_name = self.extract_root_element_name_from_bytes(xml_bytes)?;
 
-        // Parse XML to Value
         let xml_str = std::str::from_utf8(xml_bytes)
             .map_err(|e| ConversionError::XmlParseError(format!("Invalid UTF-8: {}", e)))?;
 
@@ -409,36 +408,24 @@ impl Converter {
             ConversionError::XmlParseError(format!("Failed to deserialize XML: {}", e))
         })?;
 
-        // Optimize: only unwrap text fields if they exist (check first to avoid work)
-        if self.has_text_fields(&inner_value) {
-            self.unwrap_text_fields_in_place(&mut inner_value);
-        }
+        self.unwrap_text_fields_in_place(&mut inner_value);
 
-        // Build final JSON object
-        let result = serde_json::json!({ root_name: inner_value });
+        output.clear();
 
-        // Use simd-json for faster serialization
-        let json_str = simd_json::to_string(&result)
+        // { "root_name":
+        output.push(b'{');
+        // JSON-escape the key correctly
+        serde_json::to_writer(&mut *output, root_name)
             .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
-        output
-            .write_all(json_str.as_bytes())
-            .map_err(|e| ConversionError::WriteError(e.to_string()))?;
+        output.push(b':');
+
+        // value
+        serde_json::to_writer(&mut *output, &inner_value)
+            .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
+
+        output.push(b'}');
 
         Ok(())
-    }
-
-    /// Check if a value contains any $text fields (optimization to avoid unnecessary work)
-    fn has_text_fields(&self, value: &Value) -> bool {
-        match value {
-            Value::Object(map) => {
-                if map.contains_key("$text") {
-                    return true;
-                }
-                map.values().any(|v| self.has_text_fields(v))
-            }
-            Value::Array(arr) => arr.iter().any(|v| self.has_text_fields(v)),
-            _ => false,
-        }
     }
 
     fn unwrap_text_fields_in_place(&self, value: &mut Value) {
@@ -659,21 +646,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(stats.messages_converted, 2);
-    }
-
-    #[test]
-    fn test_has_text_fields() {
-        let converter = Converter::new(ConverterConfig::default());
-
-        let value_with_text = serde_json::json!({
-            "field": { "$text": "value" }
-        });
-        assert!(converter.has_text_fields(&value_with_text));
-
-        let value_without_text = serde_json::json!({
-            "field": "value"
-        });
-        assert!(!converter.has_text_fields(&value_without_text));
     }
 
     #[test]
