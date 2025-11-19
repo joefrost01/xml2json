@@ -37,6 +37,7 @@ pub mod cli;
 pub mod converter;
 pub mod error;
 pub mod storage;
+pub mod jnode;
 
 // Re-export main types for convenience
 pub use converter::{Converter, ConverterConfig, ConversionStats};

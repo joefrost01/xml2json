@@ -9,12 +9,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use quick_xml::events::Event;
 use quick_xml::{Reader, Writer as XmlWriter};
 use rayon::prelude::*;
-use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use serde::ser::SerializeMap;
 use serde::ser::Serializer;
 use serde_json::ser::Serializer as JsonSerializer;
+use crate::jnode::{parse_xml_message_to_jnode, JsonNodeSerializer};
 
 // Buffer size constants for optimization
 const XML_BUFFER_CAPACITY: usize = 32768;
@@ -415,14 +415,10 @@ impl Converter {
         xml_bytes: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<()> {
-        let xml_str = std::str::from_utf8(xml_bytes)
-            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
+        // Parse one message into a lightweight JNode tree
+        let node = parse_xml_message_to_jnode(xml_bytes)?;
 
-        let mut inner_value: Value = quick_xml::de::from_str(xml_str)
-            .map_err(|e| ConversionError::XmlParseError(e.to_string()))?;
-
-        self.unwrap_text_fields_in_place(&mut inner_value);
-
+        // Serialize as { "<root_name>": <node> }
         output.clear();
 
         let mut ser = JsonSerializer::new(&mut *output);
@@ -430,41 +426,15 @@ impl Converter {
             .serialize_map(Some(1))
             .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
 
-        // key: root_name, value: inner_value
-        map.serialize_entry(root_name, &inner_value)
+        map.serialize_entry(root_name, &JsonNodeSerializer(&node))
             .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
+
         map.end()
             .map_err(|e| ConversionError::JsonSerializeError(e.to_string()))?;
 
         Ok(())
     }
 
-    fn unwrap_text_fields_in_place(&self, value: &mut Value) {
-        match value {
-            Value::Object(map) => {
-                // If object is exactly { "$text": <something> } then collapse to <something>
-                if map.len() == 1 {
-                    if let Some(v) = map.remove("$text") {
-                        *value = v;
-                        return;
-                    }
-                }
-
-                // Otherwise recurse into children
-                for v in map.values_mut() {
-                    self.unwrap_text_fields_in_place(v);
-                }
-            }
-            Value::Array(arr) => {
-                for v in arr.iter_mut() {
-                    self.unwrap_text_fields_in_place(v);
-                }
-            }
-            _ => {
-                // primitives: nothing to do
-            }
-        }
-    }
 }
 
 
@@ -500,6 +470,7 @@ impl ConversionStats {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use super::*;
     use crate::storage::LocalStorage;
     use tempfile::TempDir;
