@@ -1,7 +1,6 @@
 use rand::Rng;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
 
 fn main() {
     let num_files: usize = std::env::args()
